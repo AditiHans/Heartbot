@@ -1,16 +1,17 @@
-# === Core API ===
+# --- API ---
 fastapi==0.116.1
 uvicorn==0.30.6           # no [standard] -> avoids Rust watchfiles
 python-dotenv>=1.0.1
 
-# === RAG stack ===
-chromadb==1.0.20
+# --- RAG stack ---
+chromadb==1.0.20          # needs tokenizers, but wheels exist for Py 3.11
 sentence-transformers==3.0.1
 transformers==4.43.4
+tokenizers==0.19.1        # wheel available for Py 3.11 linux
 
-# === JSON accelerator (binary wheel available) ===
-orjson==3.10.7            # widely available manylinux wheel
+# --- JSON accelerator (binary wheel) ---
+orjson==3.10.7
 
-# === PyTorch (CPU) — let pip pick compatible wheel on Render
+# --- Torch CPU (binary wheel channel) ---
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
