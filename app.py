@@ -1,10 +1,10 @@
-# app.py — Heartify RAG API (cloud-only, robust)
-import os, re, asyncio, logging
+# app.py — Heartify RAG API (cloud-only, robust via HF Inference)
+import os, re, asyncio, logging, json
 from typing import List, Optional
 
-# NEW: load .env early
+# --- Load .env early (works locally; on Render you set env in dashboard) ---
 from dotenv import load_dotenv, find_dotenv
-load_dotenv(find_dotenv(), override=True)  # <— loads .env if present
+load_dotenv(find_dotenv(), override=True)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,8 +20,7 @@ os.environ.setdefault("CHROMADB_DISABLE_ONNX_RUNTIME", "1")
 
 import chromadb
 from sentence_transformers import SentenceTransformer
-import torch
-from transformers import AutoTokenizer, AutoModelForQuestionAnswering, pipeline
+import httpx
 
 # ---------- Required Cloud Config ----------
 CHROMA_HOST     = os.getenv("CHROMA_HOST")      # e.g. "api.trychroma.com"
@@ -29,21 +28,21 @@ CHROMA_TENANT   = os.getenv("CHROMA_TENANT")    # provided by trychroma
 CHROMA_DATABASE = os.getenv("CHROMA_DATABASE")  # provided by trychroma
 CHROMA_TOKEN    = os.getenv("CHROMA_API_TOKEN") # your x-chroma-token
 
+# Hugging Face Inference API (cloud model)
+HF_API_TOKEN    = os.getenv("HF_API_TOKEN")
+HF_QA_MODEL     = os.getenv("HF_QA_MODEL", "deepset/roberta-base-squad2")  # change if you prefer
+
+# Retrieval config
 COLLECTION      = os.environ.get("COLLECTION", "heart_faq")
 EMBED_MODEL     = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-MODEL_PATH      = os.environ.get("MODEL_PATH",  "Adi9818/taskB_continual")  # or your HF repo
 
+# Answering thresholds
 TOP_K_DEFAULT   = int(os.environ.get("TOP_K", "4"))
 FETCH_K_DEF     = int(os.environ.get("FETCH_K", "10"))
 MIN_TOKENS      = int(os.environ.get("MIN_TOKENS", "6"))
-MIN_CONF        = float(os.environ.get("MIN_CONF", "0.25"))
+MIN_CONF        = float(os.environ.get("MIN_CONF", "0.25"))  # used if HF returns a score
 MAX_CTX_CHARS   = int(os.environ.get("MAX_CTX_CHARS", "1400"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT_SECS", "25"))
-
-# CPU-first (cloud free tiers rarely have GPU)
-_DEVICE = -1
-if torch.cuda.is_available():
-    _DEVICE = 0
 
 # ---------- FastAPI ----------
 app = FastAPI(title="Heartify RAG API (Cloud)")
@@ -65,14 +64,15 @@ async def _unhandled(request: Request, exc: Exception):
 # ---------- Lazy singletons + retry ----------
 _collection = None
 _embedder = None
-_qa = None
+_http = None
 
 def _missing_cloud_vars() -> List[str]:
     missing = []
     if not CHROMA_HOST:     missing.append("CHROMA_HOST")
     if not CHROMA_TENANT:   missing.append("CHROMA_TENANT")
     if not CHROMA_DATABASE: missing.append("CHROMA_DATABASE")
-    if not CHROMA_TOKEN:    missing.append("CHROMA_API_TOKEN")  # matches the name we read
+    if not CHROMA_TOKEN:    missing.append("CHROMA_API_TOKEN")
+    if not HF_API_TOKEN:    missing.append("HF_API_TOKEN")
     return missing
 
 async def _retry(fn, tries=3, delay=1.0):
@@ -85,12 +85,20 @@ async def _retry(fn, tries=3, delay=1.0):
             await asyncio.sleep(delay)
     raise last
 
+async def _get_http():
+    global _http
+    if _http:
+        return _http
+    timeout = httpx.Timeout(15.0, connect=10.0)
+    _http = httpx.AsyncClient(timeout=timeout)
+    return _http
+
 async def _get_collection():
     missing = _missing_cloud_vars()
     if missing:
         raise HTTPException(
             status_code=503,
-            detail={"error": "Chroma Cloud not configured", "missing_env": missing},
+            detail={"error": "Cloud not configured", "missing_env": missing},
         )
 
     global _collection
@@ -105,7 +113,7 @@ async def _get_collection():
             database=CHROMA_DATABASE,
             headers={"x-chroma-token": CHROMA_TOKEN},
         )
-        # NOTE: Cloud collection must already be populated (build upstream).
+        # Collection must exist & be populated already
         return client.get_or_create_collection(COLLECTION)
 
     async def _coro():
@@ -125,25 +133,50 @@ async def _get_embedder():
     _embedder = await _retry(_coro)
     return _embedder
 
-async def _get_qa():
-    global _qa
-    if _qa is not None:
-        return _qa
+# ---------- Hugging Face Inference (Question Answering) ----------
+async def _hf_answer(question: str, context: str) -> dict:
+    """
+    Calls HF Inference API for extractive QA.
+    Returns dict: {"answer": str, "score": float} if available.
+    Handles loading/warmup responses gracefully.
+    """
+    http = await _get_http()
+    url = f"https://api-inference.huggingface.co/models/{HF_QA_MODEL}"
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    payload = {"inputs": {"question": question, "context": context}}
 
-    async def _coro():
-        tok = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
-        mdl = AutoModelForQuestionAnswering.from_pretrained(MODEL_PATH)
-        return pipeline(
-            "question-answering",
-            model=mdl,
-            tokenizer=tok,
-            device=_DEVICE,  # -1 CPU; 0 GPU if available
-            handle_impossible_answer=True,
-            max_answer_len=64,
-            align_to_words=True,
-        )
-    _qa = await _retry(_coro)
-    return _qa
+    # Some models return "loading" while spinning up; poll a few times
+    for _ in range(3):
+        resp = await http.post(url, headers=headers, json=payload)
+        if resp.status_code == 200:
+            data = resp.json()
+            # The API can return a single dict or a list with one dict
+            if isinstance(data, list) and data:
+                data = data[0]
+            if isinstance(data, dict) and "answer" in data:
+                # unify schema
+                return {
+                    "answer": (data.get("answer") or "").strip(),
+                    "score": float(data.get("score") or 0.0),
+                }
+            # In some cases you get a sequence output; try to parse text
+            if isinstance(data, str):
+                return {"answer": data.strip(), "score": 0.0}
+            return {"answer": "", "score": 0.0}
+        elif resp.status_code in (503, 524, 408):  # loading or timeout
+            await asyncio.sleep(1.5)
+            continue
+        else:
+            # Log the body for debugging; return safe default
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"text": resp.text}
+            log.warning("HF error %s: %s", resp.status_code, body)
+            return {"answer": "", "score": 0.0}
+
+    # If still loading after retries
+    return {"answer": "", "score": 0.0}
 
 # ---------- Helpers ----------
 NOISE_RE = re.compile(
@@ -194,10 +227,9 @@ async def health():
     return {
         "ok": ok,
         "missing_env": missing,
-        "device": ("gpu" if _DEVICE == 0 else "cpu"),
         "collection": COLLECTION,
         "embed_model": EMBED_MODEL,
-        "model_path": MODEL_PATH,
+        "hf_model": HF_QA_MODEL,
     }
 
 @app.get("/ping")
@@ -207,10 +239,6 @@ async def ping():
 @app.post("/ask")
 async def ask(req: AskRequest):
     async def _work():
-        print("chroma host",CHROMA_HOST)
-        print("chroma tenant",CHROMA_TENANT)
-        print("chroma DB",CHROMA_DATABASE)
-        print("chroma token",CHROMA_TOKEN)
         q = req.question.strip()
         if not q:
             raise HTTPException(status_code=422, detail="Question must be non-empty.")
@@ -242,14 +270,13 @@ async def ask(req: AskRequest):
         if not keep:
             return {"answer": "Not enough information in the provided context.", "confidence": 0.0, "sources": []}
 
-        # 4) Extractive QA over top docs
-        qa = await _get_qa()
+        # 4) Extractive QA via Hugging Face Inference (on top doc first; fallback to next if needed)
         best = {"text": "", "score": -1.0, "len": 0}
         for _, d_clean, _, _ in keep:
-            ctx = d_clean[:MAX_CTX_CHARS]  # truncate for stability
-            out = qa({"question": q, "context": ctx})
-            ans = re.sub(r"\s+", " ", out.get("answer", "")).strip()
-            score = float(out.get("score", 0.0))
+            ctx = d_clean[:MAX_CTX_CHARS]
+            qa_out = await _hf_answer(q, ctx)
+            ans = re.sub(r"\s+", " ", (qa_out.get("answer") or "")).strip()
+            score = float(qa_out.get("score") or 0.0)
             tok_len = len(ans.split())
             if tok_len < MIN_TOKENS:
                 continue
