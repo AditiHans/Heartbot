@@ -1,8 +1,5 @@
 fastapi
 uvicorn
 python-dotenv
+httpx
 chromadb
-sentence-transformers
-transformers
-torch
-orjson
