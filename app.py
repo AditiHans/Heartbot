@@ -1,4 +1,4 @@
-# app.py — Heartify RAG API (cloud-only, super light)
+# app.py — Heartify RAG API (cloud-only, super light, fixed)
 import os, re, asyncio, logging
 from typing import List, Optional
 
@@ -33,10 +33,13 @@ COLLECTION      = os.environ.get("COLLECTION", "heart_faq")
 
 # Answering thresholds
 TOP_K_DEFAULT   = int(os.environ.get("TOP_K", "4"))
-FETCH_K_DEF     = int(os.environ.get("FETCH_K", "10"))
-MIN_TOKENS      = int(os.environ.get("MIN_TOKENS", "6"))
-MAX_CTX_CHARS   = int(os.environ.get("MAX_CTX_CHARS", "1400"))
+FETCH_K_DEF     = int(os.environ.get("FETCH_K", "12"))   # pull a few more, helps recall
+MIN_TOKENS      = int(os.environ.get("MIN_TOKENS", "1")) # allow short spans like "Dyspnea"
+MAX_CTX_CHARS   = int(os.environ.get("MAX_CTX_CHARS", "2000"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT_SECS", "25"))
+
+# Optional debug: include top ctx previews + raw HF outputs in response
+DEBUG_CTX = os.getenv("DEBUG_CTX", "0") == "1"
 
 # ---------- FastAPI ----------
 app = FastAPI(title="Heartify RAG API (Cloud-only, lite)")
@@ -215,7 +218,7 @@ async def ask(req: AskRequest):
         scored = []
         for d, m, dist in zip(docs, metas, dists):
             d_clean = clean_context(d or "")
-            if len(d_clean) < 60:
+            if len(d_clean) < 30:          # <-- lowered cutoff (was 60)
                 continue
             sc = score_doc(d_clean, q_words, dist, (m or {}).get("source", ""))
             scored.append((sc, d_clean, (m or {}).get("source", "unknown"), float(dist)))
@@ -225,24 +228,35 @@ async def ask(req: AskRequest):
         if not keep:
             return {"answer": "Not enough information in the provided context.", "confidence": 0.0, "sources": []}
 
+        # Ask HF for each top doc; accept any non-empty answer (do not drop short spans)
         best = {"text": "", "score": -1.0, "len": 0}
+        raw_attempts = []
         for _, d_clean, _, _ in keep:
             ctx = d_clean[:MAX_CTX_CHARS]
             qa_out = await _hf_answer(q, ctx)
             ans = re.sub(r"\s+", " ", (qa_out.get("answer") or "")).strip()
             score = float(qa_out.get("score") or 0.0)
-            tok_len = len(ans.split())
-            if tok_len < MIN_TOKENS:
-                continue
-            if (score > best["score"]) or (abs(score - best["score"]) < 1e-6 and tok_len > best["len"]):
-                best = {"text": ans, "score": score, "len": tok_len}
+            raw_attempts.append({"ctx_preview": ctx[:300], "answer": ans, "score": score})
+            if ans:  # accept short answers too
+                tok_len = len(ans.split())
+                if (score > best["score"]) or (abs(score - best["score"]) < 1e-6 and tok_len > best["len"]):
+                    best = {"text": ans, "score": score, "len": tok_len}
+
+        # Friendly final fallback: first sentence of best context
+        if not best["text"]:
+            top_ctx = keep[0][1]
+            first_sentence = re.split(r'(?<=[.!?])\s+', top_ctx.strip())[0]
+            best = {"text": first_sentence, "score": 0.0, "len": len(first_sentence.split())}
 
         sources = [{"source": s, "distance": round(d, 4)} for _, _, s, d in keep]
-        return {
-            "answer": best["text"] or "Not enough information in the provided context.",
+        resp = {
+            "answer": best["text"],
             "confidence": round(max(best["score"], 0.0), 4),
             "sources": sources,
         }
+        if DEBUG_CTX:
+            resp["debug"] = raw_attempts[:2]
+        return resp
 
     try:
         return await asyncio.wait_for(_work(), timeout=REQUEST_TIMEOUT)
