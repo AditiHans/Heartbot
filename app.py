@@ -1,4 +1,3 @@
-# app.py — Heartify RAG API (cloud-only, super light, fixed)
 import os, re, asyncio, logging
 from typing import List, Optional
 
@@ -141,12 +140,34 @@ async def _hf_answer(question: str, context: str) -> dict:
         return {"answer": "", "score": 0.0}
     return {"answer": "", "score": 0.0}
 
+# ---------- Gemini Fallback ----------
+async def _gemini_answer(question: str) -> dict:
+    try:
+        url = "https://api.gemini.com/flash2.0"  # Adjust URL if required
+        headers = {"Authorization": f"Bearer {os.getenv('GEMINI_API_KEY')}"}
+        payload = {"query": question}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()  # Check for any HTTP errors
+            data = response.json()
+            if "answer" in data:
+                return {"answer": data["answer"], "confidence": 0.5}  # Adjust confidence as needed
+        return {"answer": "Unable to get a response from Gemini.", "confidence": 0.0}
+    except httpx.RequestError as e:
+        log.error(f"Error contacting Gemini API: {e}")
+        return {"answer": "Error contacting Gemini API.", "confidence": 0.0}
+    except Exception as e:
+        log.exception("Unexpected error while querying Gemini")
+        return {"answer": "Unexpected error.", "confidence": 0.0}
+
 # ---------- Helpers ----------
 NOISE_RE = re.compile(
     r"\b(dear|hello|hi)\b|thank you|thanks|best regards|regards|yours|dr\.|\bmd\b|"
     r"consult|please rate|assist you further|ask.*(doctor|hcm)|wish you",
     re.I,
 )
+
 def clean_context(text: str) -> str:
     t = re.sub(r"(?i)regards.*", "", text)
     t = re.sub(r"(?i)best regards.*", "", t)
@@ -247,6 +268,12 @@ async def ask(req: AskRequest):
             top_ctx = keep[0][1]
             first_sentence = re.split(r'(?<=[.!?])\s+', top_ctx.strip())[0]
             best = {"text": first_sentence, "score": 0.0, "len": len(first_sentence.split())}
+
+        # If confidence is too low, fallback to Gemini
+        if best["score"] < 0.5:  # Adjust threshold if needed
+            gemini_response = await _gemini_answer(q)
+            best["text"] = gemini_response["answer"]
+            best["score"] = gemini_response["confidence"]
 
         sources = [{"source": s, "distance": round(d, 4)} for _, _, s, d in keep]
         resp = {
