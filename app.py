@@ -194,6 +194,11 @@ async def health():
         "hf_model": HF_QA_MODEL,
     }
 
+# Endpoint for ping
+@app.get("/ping")
+async def ping():
+    return {"pong": True}
+
 # Endpoint to handle questions
 @app.post("/ask")
 async def ask(req: AskRequest):
