@@ -104,8 +104,6 @@ async def _get_collection():
             database=CHROMA_DATABASE,
             headers={"x-chroma-token": CHROMA_TOKEN},
         )
-        # IMPORTANT: This collection on Chroma Cloud must have an embedding function configured,
-        # so we can query with `query_texts` (not embeddings).
         return client.get_or_create_collection(COLLECTION)
 
     async def _coro(): return _open_cloud()
@@ -114,178 +112,34 @@ async def _get_collection():
 
 # ---------- Hugging Face Inference (QA) ----------
 async def _hf_answer(question: str, context: str) -> dict:
-    http = await _get_http()
-    url = f"https://api-inference.huggingface.co/models/{HF_QA_MODEL}"
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    payload = {"inputs": {"question": question, "context": context}}
-
-    for _ in range(3):  # retry a couple times (models may “warm up”)
-        r = await http.post(url, headers=headers, json=payload)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and data:
-                data = data[0]
-            if isinstance(data, dict) and "answer" in data:
-                return {"answer": (data.get("answer") or "").strip(), "score": float(data.get("score") or 0.0)}
-            if isinstance(data, str):
-                return {"answer": data.strip(), "score": 0.0}
-            return {"answer": "", "score": 0.0}
-        if r.status_code in (503, 524, 408):
-            await asyncio.sleep(1.5)
-            continue
-        try:
-            log.warning("HF error %s: %s", r.status_code, r.json())
-        except Exception:
-            log.warning("HF error %s: %s", r.status_code, r.text)
-        return {"answer": "", "score": 0.0}
-    return {"answer": "", "score": 0.0}
-
-# ---------- Gemini Fallback ----------
-async def _gemini_answer(question: str) -> dict:
     try:
-        url = "https://api.gemini.com/flash2.0"  # Adjust URL if required
-        headers = {"Authorization": f"Bearer {os.getenv('GEMINI_API_KEY')}"}
-        payload = {"query": question}
+        http = await _get_http()
+        url = f"https://api-inference.huggingface.co/models/{HF_QA_MODEL}"
+        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        payload = {"inputs": {"question": question, "context": context}}
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()  # Check for any HTTP errors
-            data = response.json()
-            if "answer" in data:
-                return {"answer": data["answer"], "confidence": 0.5}  # Adjust confidence as needed
-        return {"answer": "Unable to get a response from Gemini.", "confidence": 0.0}
-    except httpx.RequestError as e:
-        log.error(f"Error contacting Gemini API: {e}")
-        return {"answer": "Error contacting Gemini API.", "confidence": 0.0}
-    except Exception as e:
-        log.exception("Unexpected error while querying Gemini")
-        return {"answer": "Unexpected error.", "confidence": 0.0}
+        log.info(f"Sending request to Hugging Face: {payload}")
 
-# ---------- Helpers ----------
-NOISE_RE = re.compile(
-    r"\b(dear|hello|hi)\b|thank you|thanks|best regards|regards|yours|dr\.|\bmd\b|"
-    r"consult|please rate|assist you further|ask.*(doctor|hcm)|wish you",
-    re.I,
-)
-
-def clean_context(text: str) -> str:
-    t = re.sub(r"(?i)regards.*", "", text)
-    t = re.sub(r"(?i)best regards.*", "", t)
-    t = re.sub(r"(?i)thank.*", "", t)
-    t = re.sub(r"(?i)dr\.\s+[A-Z][a-z].*", "", t)
-    return re.sub(r"\s+", " ", t).strip()
-
-def score_doc(doc: str, q_words: set, dist: float, source: str) -> float:
-    kw = sum(1 for w in q_words if w in doc.lower())
-    bonus = 1.0 if "taska_ctx.json" in (source or "").lower() else 0.0
-    penalty = 1.5 if NOISE_RE.search(doc) else 0.0
-    return kw + bonus - penalty - float(dist)
-
-async def _retrieve(question: str, fetch_k: int, top_k: int):
-    # NOTE: collection must have server-side embedding function set
-    col = await _get_collection()
-    res = col.query(
-        query_texts=[question],                        # << no local embedder!
-        n_results=max(fetch_k, top_k),
-        include=["documents", "metadatas", "distances"],
-    )
-    docs  = (res.get("documents") or [[]])[0]
-    metas = (res.get("metadatas") or [[]])[0]
-    dists = (res.get("distances") or [[]])[0]
-    return docs, metas, dists
-
-# ---------- Schemas ----------
-class AskRequest(BaseModel):
-    question: str = Field(min_length=3)
-    top_k: Optional[int] = Field(default=TOP_K_DEFAULT, ge=1, le=10)
-    fetch_k: Optional[int] = Field(default=FETCH_K_DEF, ge=1, le=50)
-    extra_contexts: Optional[List[str]] = None
-
-# ---------- Endpoints ----------
-@app.get("/health")
-async def health():
-    missing = _missing_env()
-    ok = len(missing) == 0
-    return {
-        "ok": ok,
-        "missing_env": missing,
-        "collection": COLLECTION,
-        "hf_model": HF_QA_MODEL,
-    }
-
-@app.get("/ping")
-async def ping():
-    return {"pong": True}
-
-@app.post("/ask")
-async def ask(req: AskRequest):
-    async def _work():
-        q = req.question.strip()
-        if not q:
-            raise HTTPException(status_code=422, detail="Question must be non-empty.")
-
-        docs, metas, dists = await _retrieve(q, req.fetch_k or FETCH_K_DEF, req.top_k or TOP_K_DEFAULT)
-
-        # Add ephemeral user contexts (not persisted)
-        extra_docs = req.extra_contexts or []
-        docs  += extra_docs
-        metas += [{"source": "ephemeral"} for _ in extra_docs]
-        dists += [0.25 for _ in extra_docs]
-
-        if not docs:
-            return {"answer": "Not enough information in the provided context.", "confidence": 0.0, "sources": []}
-
-        q_words = {w for w in re.findall(r"[A-Za-z]+", q.lower()) if len(w) > 3}
-        scored = []
-        for d, m, dist in zip(docs, metas, dists):
-            d_clean = clean_context(d or "")
-            if len(d_clean) < 30:          # <-- lowered cutoff (was 60)
+        for _ in range(3):  # retry a couple times (models may “warm up”)
+            r = await http.post(url, headers=headers, json=payload)
+            if r.status_code == 200:
+                data = r.json()
+                log.info(f"Hugging Face response: {data}")
+                if isinstance(data, list) and data:
+                    data = data[0]
+                if isinstance(data, dict) and "answer" in data:
+                    return {"answer": (data.get("answer") or "").strip(), "score": float(data.get("score") or 0.0)}
+                if isinstance(data, str):
+                    return {"answer": data.strip(), "score": 0.0}
+            if r.status_code in (503, 524, 408):
+                await asyncio.sleep(1.5)
                 continue
-            sc = score_doc(d_clean, q_words, dist, (m or {}).get("source", ""))
-            scored.append((sc, d_clean, (m or {}).get("source", "unknown"), float(dist)))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        keep = scored[: max(req.top_k or TOP_K_DEFAULT, 1)]
-        if not keep:
-            return {"answer": "Not enough information in the provided context.", "confidence": 0.0, "sources": []}
-
-        # Ask HF for each top doc; accept any non-empty answer (do not drop short spans)
-        best = {"text": "", "score": -1.0, "len": 0}
-        raw_attempts = []
-        for _, d_clean, _, _ in keep:
-            ctx = d_clean[:MAX_CTX_CHARS]
-            qa_out = await _hf_answer(q, ctx)
-            ans = re.sub(r"\s+", " ", (qa_out.get("answer") or "")).strip()
-            score = float(qa_out.get("score") or 0.0)
-            raw_attempts.append({"ctx_preview": ctx[:300], "answer": ans, "score": score})
-            if ans:  # accept short answers too
-                tok_len = len(ans.split())
-                if (score > best["score"]) or (abs(score - best["score"]) < 1e-6 and tok_len > best["len"]):
-                    best = {"text": ans, "score": score, "len": tok_len}
-
-        # Friendly final fallback: first sentence of best context
-        if not best["text"]:
-            top_ctx = keep[0][1]
-            first_sentence = re.split(r'(?<=[.!?])\s+', top_ctx.strip())[0]
-            best = {"text": first_sentence, "score": 0.0, "len": len(first_sentence.split())}
-
-        # If confidence is too low, fallback to Gemini
-        if best["score"] < 0.5:  # Adjust threshold if needed
-            gemini_response = await _gemini_answer(q)
-            best["text"] = gemini_response["answer"]
-            best["score"] = gemini_response["confidence"]
-
-        sources = [{"source": s, "distance": round(d, 4)} for _, _, s, d in keep]
-        resp = {
-            "answer": best["text"],
-            "confidence": round(max(best["score"], 0.0), 4),
-            "sources": sources,
-        }
-        if DEBUG_CTX:
-            resp["debug"] = raw_attempts[:2]
-        return resp
-
-    try:
-        return await asyncio.wait_for(_work(), timeout=REQUEST_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Request timed out, try narrowing your question.")
+            try:
+                log.warning("HF error %s: %s", r.status_code, r.json())
+            except Exception:
+                log.warning("HF error %s: %s", r.status_code, r.text)
+            return {"answer": "", "score": 0.0}
+        return {"answer": "", "score": 0.0}
+    except Exception as e:
+        log.exception("Error while contacting Hugging Face")
+        return {"answer": "Unexpected error.", "score": 0.0}
